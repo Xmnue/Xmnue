@@ -1,0 +1,30 @@
+/include/ "system-conf.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+/ {
+};
+
+&i2c0 {
+	
+	status = "okay";
+	as9700: as9700@3E{
+		compatible = "angsemi,as9700";
+		as9700_gpio_ctrl = <1>;
+		reg = <0x3E>;
+		outp = <0x0E>;
+		outn = <0x0E>;
+		enp-gpios = <&gpio0 54 GPIO_ACTIVE_LOW>;
+        enn-gpios = <&gpio0 55 GPIO_ACTIVE_LOW>;
+		as_lcdb_outp_vreg: enp {
+			label = "outp";
+			regulator-name = "outp";
+			regulator-min-microvolt = <4000000>;
+			regulator-max-microvolt = <6500000>;
+		};
+		as_lcdb_outn_vreg: enn {
+			label = "outn";
+			regulator-name = "outn";
+			regulator-min-microvolt = <4000000>;
+			regulator-max-microvolt = <6500000>;
+	};
+};
+
