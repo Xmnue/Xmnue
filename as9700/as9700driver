@@ -1,0 +1,1335 @@
+/*  as9700driver.c - The simplest kernel module.
+
+* Copyright (C) 2013 - 2016 Xilinx, Inc
+*
+*   This program is free software; you can redistribute it and/or modify
+*   it under the terms of the GNU General Public License as published by
+*   the Free Software Foundation; either version 2 of the License, or
+*   (at your option) any later version.
+
+*   This program is distributed in the hope that it will be useful,
+*   but WITHOUT ANY WARRANTY; without even the implied warranty of
+*   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+*   GNU General Public License for more details.
+*
+*   You should have received a copy of the GNU General Public License along
+*   with this program. If not, see <http://www.gnu.org/licenses/>.
+
+*/
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/io.h>
+#include <linux/interrupt.h>
+#include <linux/of_address.h>
+#include <linux/of_device.h>
+#include <linux/of_platform.h>
+#include <linux/i2c.h>
+#include <linux/of_gpio.h>
+#include <linux/delay.h>
+#include <linux/device.h>
+#include <linux/version.h>
+#include <linux/debugfs.h>
+#include <linux/uaccess.h>
+#include <linux/leds.h>
+#include <linux/string.h>
+#include <linux/regulator/consumer.h>
+#include <linux/regulator/driver.h>
+#include <linux/regulator/machine.h>
+#include <linux/regulator/of_regulator.h>
+#include <linux/fs.h>
+
+#include "as9700.h"
+#include "as9700reg.h"
+#define DRIVER_NAME "as9700driver"
+
+struct as9700_power *as9700_data = NULL;
+
+
+static int as9700_read_reg(struct as9700_power *as9700 ,u8 reg_addr)
+{
+    u8 data;
+    struct i2c_msg msgs[] = {
+        [0] = {
+            .addr = as9700->client->addr,
+            .flags = 0,
+            .len = sizeof(reg_addr),
+            .buf = &reg_addr,
+        },
+        [1] = {
+            .addr = as9700->client->addr,
+            .flags = 1,
+            .len = sizeof(data),
+            .buf = &data,
+        },
+    };
+
+    i2c_transfer(as9700->client->adapter,msgs,2);
+    return data;
+}
+
+static void as9700_write_reg(struct as9700_power *as9700, u8 reg_addr,u8 data,u16 len)
+{
+    u8 buff[256];
+
+    struct i2c_msg msgs[] = {
+        [0] = {
+            .addr = as9700->client->addr,
+            .flags = 0,
+            .len = len+1,
+            .buf = buff,
+        },
+    };
+
+    buff[0] = reg_addr;
+    memcpy(&buff[1],&data,len);
+
+    i2c_transfer(as9700->client->adapter,msgs,1);
+}
+
+/*iic write function*/
+static int as9700_i2c_write(struct as9700_power *as9700, u8 reg, u8 val)
+{
+	int ret = -1;
+	unsigned char cnt = 0;
+
+	while (cnt < AS_I2C_RETRIES) {
+		ret = i2c_smbus_write_byte_data(as9700->client, reg, val);
+		if (ret < 0) {
+			pr_err("%s: i2c_write cnt=%d error=%d\n",
+				__func__, cnt, ret);
+		} else {
+			break;
+		}
+		cnt++;
+		usleep_range(2000, 3000);
+	}
+
+	return ret;
+}
+
+/*iic read function*/
+static int as9700_i2c_read(struct as9700_power *as9700, u8 reg, u8 *val)
+{
+	int ret = -1;
+	unsigned char cnt = 0;
+
+	while (cnt < AS_I2C_RETRIES) {
+		ret = i2c_smbus_read_byte_data(as9700->client, reg);
+		if (ret < 0) {
+			pr_err("%s: i2c_read cnt=%d error=%d\n",__func__, cnt, ret);
+		} else {
+			*val = ret;
+			break;
+		}
+		cnt++;
+		usleep_range(2000, 3000);
+	}
+	return ret;
+}
+
+/*iic write bit function*/
+static int as9700_i2c_bit_write(struct as9700_power *as9700,u8 reg_addr,u16 mask,u8 reg_data)
+{
+	uint8_t reg_val = 0;
+	uint8_t reg_mask = (uint8_t)mask;
+	int ret = 0;
+
+	ret = as9700_i2c_read(as9700, reg_addr, &reg_val);
+	reg_val &= reg_mask;
+	reg_val |= (reg_data & (~reg_mask));
+	ret = as9700_i2c_write(as9700, reg_addr, reg_val);
+
+	return ret;
+}
+
+/*iic write mask bit function*/
+static int as9700_i2c_bit_clear(struct as9700_power *as9700, u8 reg_addr, u16 mask)
+{
+	uint8_t reg_val = 0;
+	int ret = 0;
+
+	ret = as9700_i2c_read(as9700, reg_addr, &reg_val);
+	reg_val &= mask;
+	ret = as9700_i2c_write(as9700, reg_addr, reg_val);
+
+	return ret;
+}
+
+/*iic get voltage by reg function*/
+static int as9700_get_voltage_by_reg(struct as9700_power *as9700, int reg_val)
+{
+	int i = 0;
+
+			for (i = 0; i < ARRAY_SIZE(as9700_vout_map); i++) {
+				if (reg_val == as9700_vout_map[i].vout_reg) {
+					as9700->select = i;
+					return as9700_vout_map[i].voutp;
+				}
+				if (reg_val > AS9700_MAX_VOLTAGE) {
+					as9700->select = ARRAY_SIZE(as9700_vout_map) - 1;
+					return as9700_vout_map[ARRAY_SIZE(as9700_vout_map) - 1].voutp;
+				}
+			}
+
+	return 0;
+}
+
+static int as9700_get_reg_by_voltage(struct as9700_power *as9700, int vol)
+{
+	int i = 0;
+
+			for (i = 0; i < ARRAY_SIZE(as9700_vout_map); i++) {
+				if (vol == as9700_vout_map[i].voutp) {
+					as9700->select = i;
+					return as9700_vout_map[i].vout_reg;
+				}
+				if (vol > as9700_vout_map[ARRAY_SIZE(as9700_vout_map) - 1].voutp) {
+					as9700->select = ARRAY_SIZE(as9700_vout_map) - 1;
+					return as9700_vout_map[ARRAY_SIZE(as9700_vout_map) - 1].vout_reg;
+				}
+			}
+	return 0;
+}
+
+static int as9700_disn_enable(struct as9700_power *as9700)
+{
+	int ret = 0;
+
+	pr_info("%s\n", __func__);
+
+	ret = as9700_i2c_bit_write(as9700, AS9700_REG_APPS,AS9700_DISN_MASK,AS9700_DISN_ENABLE);
+	if (ret < 0)
+		pr_err("%s failed\n", __func__);
+
+	return ret;
+}
+
+static int as9700_disn_disable(struct as9700_power *as9700)
+{
+	int ret = 0;
+
+	pr_info("%s\n", __func__);
+
+	ret = as9700_i2c_bit_clear(as9700, AS9700_REG_APPS, AS9700_DISN_MASK);
+	if (ret < 0)
+		pr_err("%s  failed\n", __func__);
+
+	return ret;
+}
+
+static int as9700_disp_enable(struct as9700_power *as9700)
+{
+	int ret = 0;
+
+	pr_info("%s\n", __func__);
+
+	ret = as9700_i2c_bit_write(as9700, AS9700_REG_APPS,AS9700_DISP_MASK,AS9700_DISP_ENABLE);
+	if (ret < 0)
+		pr_err("%s failed\n", __func__);
+
+	return ret;
+}
+
+static int as9700_disp_disable(struct as9700_power *as9700)
+{
+	int ret = 0;
+
+	pr_info("%s\n", __func__);
+
+	ret = as9700_i2c_bit_clear(as9700, AS9700_REG_APPS, AS9700_DISP_MASK);
+	if (ret < 0)
+		pr_err("%s failed\n", __func__);
+
+	return ret;
+}
+
+
+static int as9700_enn_enable(struct as9700_power *as9700)
+{
+	int ret = 0;
+	
+	pr_info("%s enter\n", __func__);
+
+	if (as9700->as9700_gpio_ctrl == 1) {
+		ret = gpio_direction_output(as9700->enn_gpio, 1);
+		if (ret < 0)
+			pr_err("%s failed as_enn_high\n", __func__);
+	} 
+
+	return ret;
+}
+
+static int as9700_enn_disable(struct as9700_power *as9700)
+{
+	int ret = 0;
+	
+	pr_info("%s enter\n", __func__);
+
+	if (as9700->as9700_gpio_ctrl == 1) {
+		ret = gpio_direction_output(as9700->enn_gpio, 0);
+		if (ret < 0)
+			pr_err("%s failed for as_enn_low\n", __func__);
+	} 
+
+	return ret;
+}
+
+
+
+static int as9700_enp_enable(struct as9700_power *as9700)
+{
+	int ret = 0;
+	
+	pr_info("%s enter\n", __func__);
+
+	if (as9700->as9700_gpio_ctrl == 1) {
+		ret = gpio_direction_output(as9700->enp_gpio, 1);
+		if (ret < 0)
+			pr_err("%s failed for as_enp_high\n", __func__);
+	} 
+
+	return ret;
+}
+
+static int as9700_enp_disable(struct as9700_power *as9700)
+{
+	int ret = 0;
+	
+	pr_info("%s enter\n", __func__);
+
+	if (as9700->as9700_gpio_ctrl == 1) {
+		ret = gpio_direction_output(as9700->enp_gpio, 0);
+		if (ret < 0)
+			pr_err("%s  failed for as_enp_low\n", __func__);
+	} 
+
+	return ret;
+}
+
+
+static int as9700_voltage_outp_set(struct as9700_power *as9700)
+{
+	u8 reg_val = 0;
+	int ret = 0;
+
+		if (as9700->outp_set > AS9700_MAX_VOLTAGE)
+			as9700->outp_set = AS9700_MAX_VOLTAGE;
+
+
+	reg_val = reg_val | as9700->outp_set;
+	ret = as9700_i2c_write(as9700, AS9700_REG_VOUTP, reg_val);
+	if (ret < 0) {
+		pr_err("%s, failed.\n", __func__);
+	} else {
+		pr_info("%s out_val = %#x\n", __func__, as9700->outp_set);
+	}
+	return ret;
+}
+
+static int as9700_voltage_outn_set(struct as9700_power *as9700)
+{
+	u8 reg_val = 0;
+	int ret = 0;
+
+
+		if (as9700->outn_set > AS9700_MAX_VOLTAGE)
+			as9700->outn_set = AS9700_MAX_VOLTAGE;
+
+
+	reg_val = reg_val | as9700->outn_set;
+	ret = as9700_i2c_write(as9700, AS9700_REG_VOUTN, reg_val);
+	if (ret < 0) {
+		pr_err("%s, failed.\n", __func__);
+	} else {
+		pr_info("%s out_val = %#x\n", __func__, as9700->outn_set);
+	}
+	return ret;
+}
+
+static int as9700_voltage_outp_get(struct as9700_power *as9700)
+{
+	u8 reg_val = 0;
+	int ret = 0;
+
+	pr_info("%s\n", __func__);
+
+	ret = as9700_i2c_read(as9700, AS9700_REG_VOUTP, &reg_val);
+	if (ret < 0) {
+		pr_err("%s, failed.\n", __func__);
+	} else {
+		as9700->read_outp = reg_val;
+	}
+	return ret;
+}
+
+static int as9700_voltage_outn_get(struct as9700_power *as9700)
+{
+	u8 reg_val = 0;
+	int ret = 0;
+
+	pr_info("%s\n", __func__);
+
+	ret = as9700_i2c_read(as9700, AS9700_REG_VOUTN, &reg_val);
+	if (ret < 0) {
+		pr_err("%s, failed.\n", __func__);
+	} else {
+		as9700->read_outn = reg_val;
+	}
+	return ret;
+}
+
+/* ****************************************************** regulator driver ******************************************************************* */
+
+
+static int as9700_list_voltage(struct regulator_dev *rdev, unsigned selector)
+{
+	if (selector > rdev->desc->n_voltages)
+			return -EINVAL;
+	if (selector <= rdev->desc->linear_min_sel)
+			return 0;
+
+	return rdev->desc->min_uV + (rdev->desc->uV_step * selector);
+}
+
+static int as9700_set_voltage(struct regulator_dev *rdev,int vol_min, int vol_max,unsigned *selector)
+{
+	int ret = 0;
+	struct as9700_power *as9700 = rdev_get_drvdata(rdev);
+
+	pr_info("%s enter\n", __func__);
+
+	if (strcmp(rdev->desc->name, "outp") == 0) {
+		as9700->outp = vol_min;
+		as9700->outp_set = as9700_get_reg_by_voltage(as9700, as9700->outp);//?
+		ret = as9700_voltage_outp_set(as9700);
+		if (ret < 0)
+			pr_err("%s, as9700_voltage_outp_set error\n", __func__);
+	} else if (strcmp(rdev->desc->name, "outn") == 0) {
+		as9700->outn = vol_min;
+		as9700->outn_set = as9700_get_reg_by_voltage(as9700, as9700->outn);
+		ret = as9700_voltage_outn_set(as9700);
+		if (ret < 0)
+			pr_err("%s, as9700_voltage_outn_set error\n", __func__);
+	} else {
+		pr_err("%s, regulator outp/outn set failed\n", __func__);
+		ret = -EINVAL;
+	}
+
+	return ret;
+}
+
+static int as9700_get_voltage_sel(struct regulator_dev *rdev)
+{
+	int ret = 0;
+	struct as9700_power *as9700 = rdev_get_drvdata(rdev);
+
+	pr_info("%s enter\n", __func__);
+
+	if (strcmp(rdev->desc->name, "outp") == 0) {
+		ret = as9700_voltage_outp_get(as9700);
+		if (ret < 0) {
+			pr_err("%s, as9700_voltage_outp_get error\n", __func__);
+			return ret;
+		}
+		as9700->outp = as9700_get_voltage_by_reg(as9700, as9700->read_outp);
+		return as9700->outp;
+	} else if (strcmp(rdev->desc->name, "outn") == 0) {
+		ret = as9700_voltage_outn_get(as9700);
+		if (ret < 0) {
+			pr_err("%s, as9700_voltage_outn_get error\n", __func__);
+			return ret;
+		}
+		as9700->outn = as9700_get_voltage_by_reg(as9700, as9700->read_outn);
+		return as9700->outn;
+	} else {
+		pr_err("%s, regulator dev error\n", __func__);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int as9700_get_voltage(struct regulator_dev *rdev)
+{
+	int ret = 0;
+	struct as9700_power *as9700 = rdev_get_drvdata(rdev);
+
+
+		ret = as9700_get_voltage_sel(rdev);
+
+
+	return ret;
+}
+
+int as9700_map_voltage(struct regulator_dev *rdev,int min_uV, int max_uV)
+{
+	int i = 0, ret = 0;
+
+	pr_info("%s enter\n", __func__);
+
+	for (i = 0; i < rdev->desc->n_voltages; i++) {
+		ret = rdev->desc->ops->list_voltage(rdev, i);
+		if (ret < 0)
+			continue;
+		if (ret > max_uV)
+			break;
+
+		if (ret >= min_uV && ret <= max_uV)
+			return i;
+	}
+
+	return -EINVAL;
+}
+
+static int as9700_enable(struct regulator_dev *rdev)
+{
+	int ret = 0;
+	struct as9700_power *as9700 = rdev_get_drvdata(rdev);
+
+	pr_info("%s enter\n", __func__);
+
+	if (strcmp(rdev->desc->name, "outp") == 0) {
+
+		ret = as9700_enp_enable(as9700);
+		if (ret < 0)
+			pr_err("%s, as9700_enp_enable_set error\n", __func__);
+	} else if (strcmp(rdev->desc->name, "outn") == 0) {
+
+		ret = as9700_enn_enable(as9700);
+		if (ret < 0)
+			pr_err("%s, as9700_enn_enable_set error\n", __func__);
+	} else {
+		pr_err("%s, regulator outp/outn set failed\n", __func__);
+		ret = -EINVAL;
+	}
+
+	return ret;
+}
+
+static int as9700_disable(struct regulator_dev *rdev)
+{
+	int ret = 0;
+	struct as9700_power *as9700 = rdev_get_drvdata(rdev);
+
+	pr_info("%s enter\n", __func__);
+
+	if (strcmp(rdev->desc->name, "outp") == 0) {
+
+		ret = as9700_enp_disable(as9700);
+		if (ret < 0)
+			pr_err("%s, as9700_enp_enable_set error\n", __func__);
+	} else if (strcmp(rdev->desc->name, "outn") == 0) {
+
+		ret = as9700_enn_disable(as9700);
+		if (ret < 0)
+			pr_err("%s, as9700_enn_enable_set error\n", __func__);
+	} else {
+		pr_err("%s, regulator outp/outn set failed\n", __func__);
+		ret = -EINVAL;
+	}
+
+	return ret;
+}
+
+
+static struct regulator_ops as9700_outp_ops = {
+	.list_voltage = as9700_list_voltage,
+	.set_voltage = as9700_set_voltage,
+	.get_voltage = as9700_get_voltage,
+	.get_voltage_sel = as9700_get_voltage_sel,
+	.map_voltage = as9700_map_voltage,
+	.enable = as9700_enable,
+	.disable = as9700_disable,
+
+};
+static struct regulator_ops as9700_outn_ops = {
+	.list_voltage = as9700_list_voltage,
+	.set_voltage = as9700_set_voltage,
+	.get_voltage = as9700_get_voltage,
+	.get_voltage_sel = as9700_get_voltage_sel,
+	.map_voltage = as9700_map_voltage,
+	.enable = as9700_enable,
+	.disable = as9700_disable,
+
+};
+
+static struct regulator_desc as9700_desc[] = {
+	{
+		.name = "outp",
+		.id = 0,
+		.n_voltages = N_VOLTAGE,
+		.min_uV = MIN_VOLTAGE,
+		.uV_step = UV_STEP,
+		.linear_min_sel = 0,
+		.ops = &as9700_outp_ops,
+		.type = REGULATOR_VOLTAGE,
+		.owner = THIS_MODULE,
+	},
+	{
+		.name = "outn",
+		.id = 1,
+		.n_voltages = N_VOLTAGE,
+		.min_uV = MIN_VOLTAGE,
+		.uV_step = UV_STEP,
+		.linear_min_sel = 0,
+		.ops = &as9700_outn_ops,
+		.type = REGULATOR_VOLTAGE,
+		.owner = THIS_MODULE,
+	},
+};
+
+/***************************sys attribute*********************************/
+
+static ssize_t as9700_reg_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct as9700_power *as9700 = dev_get_drvdata(dev);
+
+	unsigned char i = 0, reg_val = 0;
+	ssize_t len = 0;
+	int ret = 0;
+
+	pr_info("%s\n", __func__);
+
+	for (i = 0; i < AS9700_REG_MAX; i++) {
+
+		ret = as9700_i2c_read(as9700, i, &reg_val);
+		if (ret < 0) {
+			pr_err("as9700_i2c_read failed,ret = %d\n", ret);
+			break;
+		}
+		len += snprintf(buf+len, PAGE_SIZE-len, "reg:0x%02x=0x%02x\n",
+				i, reg_val);
+	}
+
+	return len;
+}
+
+static ssize_t as9700_reg_store(struct device *dev,
+			     struct device_attribute *attr,
+			     const char *buf, size_t len)
+{
+	struct as9700_power *as9700 = dev_get_drvdata(dev);
+	int ret = 0;
+	unsigned int databuf[2] = {0};
+
+	pr_info("%s\n", __func__);
+
+	if (sscanf(buf, "%x %x", &databuf[0], &databuf[1]) == 2) {
+		ret = as9700_i2c_write(as9700, (unsigned char)databuf[0],
+				       (unsigned char)databuf[1]);
+		if (ret < 0)
+			return ret;
+	}
+
+	return len;
+}
+
+static ssize_t as9700_power_outp_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	ssize_t len = 0;
+	int ret = 0;
+	struct as9700_power *as9700 = dev_get_drvdata(dev);
+
+	pr_info("%s\n", __func__);
+
+	if (as9700->regulators[0] == NULL)
+		return -ENOSPC;
+	ret = as9700->regulators[0]
+		     ->desc->ops->get_voltage(as9700->regulators[0]);
+	if (ret < 0) {
+		pr_err("get_voltage_sel failed,ret = %d\n", ret);
+		return ret;
+	}
+
+	len += snprintf(buf + len, PAGE_SIZE - len, "outp : %d\n", ret);
+
+	return len;
+}
+
+static ssize_t as9700_power_outp_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t len)
+{
+	struct as9700_power *as9700 = dev_get_drvdata(dev);
+	int ret = 0;
+	unsigned int databuf[1] = {0};
+
+	pr_info("%s\n", __func__);
+
+	if (sscanf(buf, "%x", &databuf[0]) == 1) {
+		if (databuf[0] >= MIN_VOLTAGE_VAL && databuf[0] <= MAX_VOLTAGE_VAL) {
+			as9700->outp = as9700_get_voltage_by_reg(as9700, databuf[0]);
+			if (as9700->regulators[0] == NULL)
+				return -ENOSPC;
+			ret = as9700->regulators[0]->desc->ops->set_voltage(as9700->regulators[0],
+			as9700->outp, as9700->outp, NULL);
+			if (ret < 0) {
+				pr_err("%s set_voltage_sel error\n", __func__);
+				return ret;
+			}
+		}
+	}
+
+	return len;
+}
+
+static ssize_t as9700_power_outn_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	ssize_t len = 0;
+	int ret = 0;
+	struct as9700_power *as9700 = dev_get_drvdata(dev);
+
+	pr_info("%s\n", __func__);
+
+	if (as9700->regulators[1] == NULL)
+		return -ENOSPC;
+	ret = as9700->regulators[1]
+		     ->desc->ops->get_voltage(as9700->regulators[1]);
+	if (ret < 0 && ret > -MIN_VOLTAGE) {
+		pr_err("%s get_voltage_sel failed\n", __func__);
+		return ret;
+	}
+	len += snprintf(buf + len, PAGE_SIZE - len, "outn : %d\n", -ret);
+
+	return len;
+}
+
+static ssize_t as9700_power_outn_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t len)
+{
+	struct as9700_power *as9700 = dev_get_drvdata(dev);
+	int ret = 0;
+	unsigned int databuf[1] = {0};
+
+	pr_info("%s\n", __func__);
+
+	if (sscanf(buf, "%x", &databuf[0]) == 1) {
+		if (databuf[0] >= MIN_VOLTAGE_VAL && databuf[0] <= MAX_VOLTAGE_VAL) {
+			as9700->outn = as9700_get_voltage_by_reg(as9700, databuf[0]);
+			if (as9700->regulators[1] == NULL)
+				return -ENOSPC;
+			ret = as9700->regulators[1]->desc->ops->set_voltage(as9700->regulators[1],
+			as9700->outn, as9700->outn, NULL);
+			if (ret < 0) {
+				pr_err("%s set_voltage_sel error\n", __func__);
+				return ret;
+			}
+		}
+	}
+
+	return len;
+}
+
+static ssize_t as9700_enn_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	ssize_t len = 0;
+	struct as9700_power *as9700 = dev_get_drvdata(dev);
+	int ret = 0;
+
+	pr_info("%s\n", __func__);
+
+	if (as9700->regulators[1] == NULL)
+		return -ENOSPC;
+	ret = as9700->regulators[1]
+		     ->desc->ops->is_enabled(as9700->regulators[1]);
+	if (ret < 0) {
+		pr_err("%s is_enabled error\n", __func__);
+		return ret;
+	}
+
+	len += snprintf(buf + len, PAGE_SIZE - len, "outn status: %d\n", ret);
+
+	return len;
+}
+
+static ssize_t as9700_enn_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t len)
+{
+	struct as9700_power *as9700 = dev_get_drvdata(dev);
+	int ret = 0;
+	int val = 0;
+
+	pr_info("%s\n", __func__);
+
+	ret = kstrtouint(buf, 0, &val);
+	if (ret < 0) {
+		pr_err("%s kstrtouint failed\n", __func__);
+		return ret;
+	}
+	pr_info("%s val = %d\n", __func__, val);
+
+	if (as9700->regulators[1] == NULL)
+		return -ENOSPC;
+	if (val == 1) {
+		ret = as9700->regulators[1]
+			     ->desc->ops->enable(as9700->regulators[1]);
+		if (ret < 0) {
+			pr_err("%s enable error\n", __func__);
+			return ret;
+		}
+	} else if (val == 0) {
+		ret = as9700->regulators[1]
+			     ->desc->ops->disable(as9700->regulators[1]);
+		if (ret < 0) {
+			pr_err("%s disable error\n", __func__);
+			return ret;
+		}
+	} else {
+		pr_err("%s input val error\n", __func__);
+		return -EINVAL;
+	}
+
+	return len;
+}
+
+static ssize_t as9700_enp_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+
+	ssize_t len = 0;
+	struct as9700_power *as9700 = dev_get_drvdata(dev);
+	int ret = 0;
+
+	pr_info("%s\n", __func__);
+
+	if (as9700->regulators[0] == NULL)
+		return -ENOSPC;
+	ret = as9700->regulators[0]
+		     ->desc->ops->is_enabled(as9700->regulators[0]);
+	if (ret < 0) {
+		pr_err("%s is_enabled error\n", __func__);
+		return ret;
+	}
+
+	len += snprintf(buf + len, PAGE_SIZE - len, "outp status: %d\n", ret);
+
+	return len;
+}
+
+static ssize_t as9700_enp_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t len)
+{
+	struct as9700_power *as9700 = dev_get_drvdata(dev);
+	int ret = 0;
+	int val = 0;
+
+	pr_info("%s\n", __func__);
+
+	ret = kstrtouint(buf, 10, &val);
+	if (ret < 0) {
+		pr_err("%s kstrtouint failed\n", __func__);
+		return ret;
+	}
+	pr_info("%s val = %d\n", __func__, val);
+
+	if (as9700->regulators[0] == NULL)
+		return -ENOSPC;
+	if (val == 1) {
+		ret = as9700->regulators[0]
+			     ->desc->ops->enable(as9700->regulators[0]);
+		if (ret < 0) {
+			pr_err("%s enable error\n", __func__);
+			return ret;
+		}
+	} else if (val == 0) {
+		ret = as9700->regulators[0]
+			     ->desc->ops->disable(as9700->regulators[0]);
+		if (ret < 0) {
+			pr_err("%s disable error\n", __func__);
+			return ret;
+		}
+	} else {
+		pr_err("%s input val error\n", __func__);
+		return -EINVAL;
+	}
+
+	return len;
+}
+
+
+
+static ssize_t as9700_disn_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t len)
+{
+	struct as9700_power *as9700 = dev_get_drvdata(dev);
+	int ret = 0;
+	int val = 0;
+
+	ret = kstrtouint(buf, 0, &val);
+	if (ret < 0) {
+		pr_err("%s kstrtouint failed\n", __func__);
+		return ret;
+	}
+	if (val > 0) {
+		ret = as9700_disn_enable(as9700);
+		if (ret < 0) {
+			pr_err("%s as9700_disn_enable error\n", __func__);
+			return ret;
+		}
+	} else if (val == 0) {
+		ret = as9700_disn_disable(as9700);
+		if (ret < 0) {
+			pr_err("%s as9700_disn_disable error\n", __func__);
+			return ret;
+		}
+	} else {
+		return -EINVAL;
+	}
+	return len;
+}
+
+static ssize_t as9700_disp_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t len)
+{
+	struct as9700_power *as9700 = dev_get_drvdata(dev);
+	int ret = 0;
+	int val = 0;
+
+	ret = kstrtouint(buf, 0, &val);
+	if (ret < 0) {
+		pr_err("%s kstrtouint failed\n", __func__);
+		return ret;
+	}
+	if (val > 0) {
+		ret = as9700_disp_enable(as9700);
+		if (ret < 0) {
+			pr_err("%s as9700_disp_enable error\n",
+				__func__);
+			return ret;
+		}
+	} else if (val == 0) {
+		ret = as9700_disp_disable(as9700);
+		if (ret < 0) {
+			pr_err("%s as9700_disp_disable error\n",
+				__func__);
+			return ret;
+		}
+	} else {
+		return -EINVAL;
+	}
+	return len;
+}
+
+static ssize_t as9700_listoutp_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t len)
+{
+	struct as9700_power *as9700 = dev_get_drvdata(dev);
+	int ret = 0;
+	int val = 0;
+
+	ret = kstrtouint(buf, 10, &val);
+	if (ret < 0) {
+		pr_err("%s kstrtouint failed\n", __func__);
+		return ret;
+	}
+	if (val < 0 || val >= N_VOLTAGE) {
+		pr_err("%s,error n_voltage = %d\n", __func__, val);
+		return -EINVAL;
+	}
+	if (as9700->regulators[0] == NULL)
+		return -ENOSPC;
+	ret =
+	as9700->regulators[0]->desc->ops->list_voltage(as9700->regulators[0],val);
+	if (ret < 0) {
+		pr_err("%s list_voltage error\n", __func__);
+		return ret;
+	}
+	pr_info("%s, list_voltage result = %d\n", __func__, ret);
+	return len;
+}
+
+static ssize_t as9700_listoutn_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t len)
+{
+	struct as9700_power *as9700 = dev_get_drvdata(dev);
+	int ret = 0;
+	int val = 0;
+
+	pr_info("%s,enter\n", __func__);
+
+	ret = kstrtouint(buf, 10, &val);
+	if (ret < 0) {
+		pr_err("%s kstrtouint failed\n", __func__);
+		return ret;
+	}
+	if (val < 0 || val >= N_VOLTAGE)
+		return -EINVAL;
+
+	if (as9700->regulators[1] == NULL)
+		return -ENOSPC;
+
+	ret =
+	as9700->regulators[1]->desc->ops->list_voltage(as9700->regulators[1],
+							val);
+	if (ret < 0) {
+		pr_err("%s list_voltage error\n", __func__);
+		return ret;
+	}
+	pr_info("%s, list_voltage result = %d\n", __func__, ret);
+	return len;
+}
+
+static DEVICE_ATTR(reg, 0664, as9700_reg_show, as9700_reg_store);
+static DEVICE_ATTR(outp, 0664, as9700_power_outp_show,
+			       as9700_power_outp_store);
+static DEVICE_ATTR(outn, 0664, as9700_power_outn_show,
+			       as9700_power_outn_store);
+static DEVICE_ATTR(enn, 0664, as9700_enn_show, as9700_enn_store);
+static DEVICE_ATTR(enp, 0664, as9700_enp_show, as9700_enp_store);
+
+static DEVICE_ATTR(disn, 0664, NULL, as9700_disn_store);
+static DEVICE_ATTR(disp, 0664, NULL, as9700_disp_store);
+static DEVICE_ATTR(list_outp, 0664, NULL, as9700_listoutp_store);
+static DEVICE_ATTR(list_outn, 0664, NULL, as9700_listoutn_store);
+
+
+static struct attribute *as9700_power_attributes[] = {
+	&dev_attr_reg.attr,
+	&dev_attr_outp.attr,
+	&dev_attr_outn.attr,
+	&dev_attr_enn.attr,
+	&dev_attr_enp.attr,
+	&dev_attr_disn.attr,
+	&dev_attr_disp.attr,
+	&dev_attr_list_outp.attr,
+	&dev_attr_list_outn.attr,
+	
+	NULL,
+};
+
+static struct attribute_group as9700_power_attr_group = {
+	.attrs = as9700_power_attributes
+};
+
+/****************************************************	driver	********************************************************************** */
+static int as9700_i2c_read_vendor_id(struct as9700_power *as9700)
+{
+	int ret = 0;
+	u8 val = 0;
+
+	ret = as9700_i2c_read(as9700, AS9700_REG_CTRL, &val);
+	as9700->vendorID = val ;//& AS9700_VENDOR_ID_MASK;
+	//as9700->vendorID = 0xF1;
+	if (ret < 0) {
+		pr_err("as9700_i2c_read failed,ret = %d\n", ret);
+		return ret;
+	}
+	pr_info("as9700 read vendor id = %#x\n", as9700->vendorID);
+	if (as9700->vendorID != AS9700_VENDOR_ID) {
+		pr_err("%s read vendor ID error!\n", __func__);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int as9700_gpio_init(struct as9700_power *as9700, struct i2c_client *i2c)
+{
+	int ret = 0;
+
+	pr_info("%s enter\n", __func__);
+
+	if (gpio_is_valid(as9700->enn_gpio)) {
+		ret = devm_gpio_request_one(&i2c->dev, as9700->enn_gpio,GPIOF_OUT_INIT_HIGH, "enn_gpio");
+		if (ret) {
+			pr_err("%s: enn request failed\n", __func__);
+			return ret;
+		}
+	}
+	if (gpio_is_valid(as9700->enp_gpio)) {
+		ret = devm_gpio_request_one(&i2c->dev, as9700->enp_gpio,GPIOF_OUT_INIT_HIGH, "enp_gpio");
+		if (ret) {
+			pr_err("%s:enp request failed\n", __func__);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+
+static int as9700_parse_dt(struct i2c_client *i2c, struct as9700_power *as9700,struct device_node *np)
+{
+	int rc = 0;
+	struct device *dev = &i2c->dev;
+	const char *label;
+	struct device_node *temp;
+
+	pr_info("%s enter\n", __func__);
+
+	rc = of_property_read_u32(np, "as9700_gpio_ctrl",&as9700->as9700_gpio_ctrl);
+	if (rc < 0) {
+		pr_err("Failure reading as9700_gpio_ctrl, rc = %d\n", rc);
+	}
+
+	if (as9700->as9700_gpio_ctrl == 1) {
+		as9700->enn_gpio = of_get_named_gpio(np, "enn-gpios", 0);
+		if (gpio_is_valid(as9700->enn_gpio)) {
+			dev_info(dev, "%s: enn gpio provided ok.\n", __func__);
+		} else {
+			pr_err("%s: no enn gpio provided.\n", __func__);
+			return -EIO;
+		}
+
+		as9700->enp_gpio = of_get_named_gpio(np, "enp-gpios", 0);
+		if (gpio_is_valid(as9700->enp_gpio)) {
+			dev_info(dev, "%s: enp gpio provided ok.\n", __func__);
+		} else {
+			pr_err("%s: no enp gpio provided.\n", __func__);
+			return -EIO;
+		}
+
+		rc = as9700_gpio_init(as9700, i2c);
+		if (rc < 0) {
+			pr_err("as9700_gpio_init failed, rc = %d\n", rc);
+			return rc;
+		}
+		pr_info("%s: ctrl by gpio\n", __func__);
+	} else {
+		pr_info("%s: ctrl by IIC\n", __func__);
+	}
+
+	rc = of_property_read_u32(np, "outp", &as9700->outp_set);
+	if (rc < 0) {
+		pr_err("Failure reading outp, rc = %d\n", rc);
+		goto read_err;
+	} else {
+		pr_info("%s,outp = %#x\n",  __func__, as9700->outp_set);
+	}
+
+	rc = of_property_read_u32(np, "outn", &as9700->outn_set);
+	if (rc < 0) {
+		pr_err("Failure reading outn, rc = %d\n", rc);
+		goto read_err;
+	} else {
+		pr_info("%s,outn = %#x\n", __fnpunc__, as9700->outn_set);
+	}
+
+
+	for_each_available_child_of_node(np, temp) {
+		rc = of_property_read_string(temp, "label", &label);
+		if (rc < 0) {
+			pr_err("%s, Failed to read label rc=%d\n", __func__, rc);
+			return rc;
+		}
+		if (strcmp(label, "outp") == 0) {
+			as9700->as_node[0] = temp;
+			pr_info("%s,lable for ldo found.\n", __func__);
+		} else if (strcmp(label, "outn") == 0) {
+			as9700->as_node[1] = temp;
+			pr_info("%s,lable for ncp found.\n", __func__);
+		} else {
+			pr_err("%s, Failed to identify label %s\n", __func__, label);
+			return -EINVAL;
+		}
+	}
+	
+
+	return 0;
+
+read_err:
+	if (as9700->as9700_gpio_ctrl == 1) {
+		devm_gpio_free(&i2c->dev, as9700->enn_gpio);
+		devm_gpio_free(&i2c->dev, as9700->enp_gpio);
+	}
+	return rc;
+
+}
+
+
+int as9700_power_probe(struct i2c_client *i2c , const struct i2c_device_id *id)
+{
+	pr_info("%s\n", __func__);
+	int ret = 0;
+	int  i = 0;
+	struct as9700_power *as9700 = NULL;
+	struct device_node *node = i2c->dev.of_node;
+
+	if (!i2c_check_functionality(i2c->adapter, I2C_FUNC_I2C)) {
+		pr_err("check_functionality failed\n");
+		return -EIO;
+	}
+
+	as9700 = devm_kzalloc(&i2c->dev,(sizeof(struct as9700_power)), GFP_KERNEL);
+	if (!as9700)
+		return -ENOMEM;
+
+	as9700_data = as9700;
+	as9700->dev = &i2c->dev;
+	as9700->client = i2c;
+
+	if (node) {
+		ret = as9700_parse_dt(i2c, as9700, node);
+		if (ret < 0)
+			goto chip_error;
+	} else {
+		pr_err("%s, failed device node is null!\n", __func__);
+		goto chip_error;
+	}
+   i2c_set_clientdata(i2c, as9700);
+
+	ret = as9700_i2c_read_vendor_id(as9700);
+	if (ret < 0)
+		goto chip_error;
+
+	for (i = 0; i < ARRAY_SIZE(as9700_desc); i++) {
+
+		struct regulator_desc *desc = &as9700_desc[i];
+		struct regulator_init_data *init = NULL;
+		struct regulator_config config = { };
+
+		if (&as9700->as_node[i] == NULL) {
+			pr_err(" %s as9700->as_node[%d] is NULL.\n", __func__, i);
+			break;
+		}
+
+		init = of_get_regulator_init_data(&i2c->dev, as9700->as_node[i], &desc[i]);
+
+		if (init != NULL) {
+			pr_err(" %s Failed to get init_data %s\n", __func__, desc->name);
+			of_node_put(node);
+			goto regulator_error;
+		}
+
+		config.dev = &i2c->dev;
+		config.init_data = init;
+		config.driver_data = as9700;
+		config.of_node = as9700->as_node[i];
+
+		as9700->regulators[i] = devm_regulator_register(&i2c->dev,desc, &config);
+		if (IS_ERR(as9700->regulators[i])) {
+			ret = PTR_ERR(as9700->regulators[i]);
+			pr_err("failed to register regulator %s:%d\n", desc->name, ret);
+			goto regulator_error;
+		}
+	}
+
+
+ret = sysfs_create_group(&as9700->dev->kobj,&as9700_power_attr_group);
+	if (ret < 0) {
+		pr_err("power sysfs ret: %d\n", ret);
+		goto regulator_error;
+	}
+
+
+	ret = as9700->regulators[0]->desc->ops->enable(as9700->regulators[0]);
+	if (ret < 0) {
+		pr_err("%s enable error\n", __func__);
+		return ret;
+	}
+
+	mdelay(10);
+
+	ret = as9700->regulators[1]->desc->ops->enable(as9700->regulators[1]);
+	if (ret < 0) {
+		pr_err("%s enable error\n", __func__);
+		return ret;	
+	}
+	
+	pr_info("%s exit.\n", __func__);
+
+
+    return 0;
+
+					
+regulator_error:
+	while (--i >= 0)
+		regulator_unregister(as9700->regulators[i]);
+chip_error:
+	devm_kfree(&i2c->dev, as9700);
+	as9700 = NULL;
+	as9700_data = NULL;
+	return ret;
+};
+
+int as9700_power_remove(struct i2c_client *i2c)
+{
+    struct as9700_power *as9700 = i2c_get_clientdata(i2c);
+	int i = 2;
+
+	pr_info("%s\n", __func__);
+	sysfs_remove_group(&as9700->dev->kobj, &as9700_power_attr_group);
+	while (--i >= 0)
+		devm_regulator_unregister(as9700->dev, as9700->regulators[i]);
+
+	if (as9700->as9700_gpio_ctrl == 1) {
+		devm_gpio_free(&i2c->dev, as9700->enn_gpio);
+		devm_gpio_free(&i2c->dev, as9700->enp_gpio);
+	}
+
+	devm_kfree(&i2c->dev, as9700);
+	as9700 = NULL;
+	return 0;
+};
+
+
+
+
+/* 传统的id_table匹配方式 */
+static const struct i2c_device_id as9700_id[] = {
+    {"as9700"},
+    {}
+};
+
+/* of匹配表, 设备树下的匹配方式 */
+static const struct of_device_id as9700_of_match[] =
+{
+    { .compatible = "angsemi,as9700"},
+    {}
+};
+
+struct i2c_driver as9700_power_driver = {
+    .driver = {
+        .owner = THIS_MODULE,
+        .name  = "as9700",
+        .of_match_table = as9700_of_match,
+    },
+    .id_table = as9700_id,
+    .probe = as9700_power_probe,
+    .remove = as9700_power_remove,
+};
+
+static int as9700_driver_init(void)
+{
+    int ret;
+
+    ret = i2c_add_driver(&as9700_power_driver);
+    if (ret<0)
+    {
+        printk("i2c_add_driver error\n");
+        return ret;
+    }
+    
+    return 0;
+}
+
+static void as9700_driver_exit(void)
+{
+
+    i2c_del_driver(&as9700_power_driver);
+}
+
+module_init(as9700_driver_init);
+module_exit(as9700_driver_exit);
+
+
+/* Standard module information, edit as appropriate */
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR
+    ("Xilinx Inc.");
+MODULE_DESCRIPTION
+    ("as9700driver - loadable module template generated by petalinux-create -t modules");
+
+
